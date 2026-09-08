@@ -448,9 +448,9 @@ static int buf_silent(const short *p, int n)
     return 1;
 }
 
-/* ---- clean shutdown ----
- * Stop the audio while the process is still healthy. */
-static void audio_stop(void)
+/* ---- waveOut lifetime ----
+ * Keep the stream closed while the OPL is idle. */
+static void audio_close(void)
 {
     int i;
     if (hwo) {
@@ -460,6 +460,44 @@ static void audio_stop(void)
         waveOutClose(hwo);
         hwo = NULL;
     }
+}
+
+static int audio_open(HANDLE hev)
+{
+    WAVEFORMATEX wf;
+    int i;
+
+    wf.wFormatTag      = WAVE_FORMAT_PCM;
+    wf.nChannels       = 2;
+    wf.nSamplesPerSec  = RATE;
+    wf.wBitsPerSample  = 16;
+    wf.nBlockAlign     = 4;
+    wf.nAvgBytesPerSec = RATE * 4;
+    wf.cbSize          = 0;
+
+    if (waveOutOpen(&hwo, WAVE_MAPPER, &wf, (DWORD)hev, 0, CALLBACK_EVENT)
+            != MMSYSERR_NOERROR)
+        return 0;
+
+    for (i = 0; i < nbuf; i++) {
+        hdr[i].lpData         = (char *)bufs[i];
+        hdr[i].dwBufferLength = FRAMES * 4;
+        hdr[i].dwFlags        = 0;
+        hdr[i].dwLoops        = 0;
+        waveOutPrepareHeader(hwo, &hdr[i], sizeof(WAVEHDR));
+        drain_events();
+        render_buffer(bufs[i]);
+        apply_gain(bufs[i], FRAMES * 2);
+        waveOutWrite(hwo, &hdr[i], sizeof(WAVEHDR));
+    }
+    return 1;
+}
+
+/* ---- clean shutdown ----
+ * Stop the audio while the process is still healthy. */
+static void audio_stop(void)
+{
+    audio_close();
     if (hmidi) {
         midiOutReset(hmidi);               /* all-notes-off on the synth */
         midiOutClose(hmidi);
@@ -515,7 +553,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 {
     static WNDCLASS wc;                    /* static: zero-initialized */
-    WAVEFORMATEX wf;
     HANDLE       hev;
     int   i;
     int   idle     = 0;                    /* skipping synthesis (chip silent) */
@@ -568,32 +605,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 
     hev = CreateEvent(NULL, FALSE, FALSE, NULL);
 
-    wf.wFormatTag      = WAVE_FORMAT_PCM;
-    wf.nChannels       = 2;
-    wf.nSamplesPerSec  = RATE;
-    wf.wBitsPerSample  = 16;
-    wf.nBlockAlign     = 4;
-    wf.nAvgBytesPerSec = RATE * 4;
-    wf.cbSize          = 0;
-
-    if (waveOutOpen(&hwo, WAVE_MAPPER, &wf, (DWORD)hev, 0, CALLBACK_EVENT)
-            != MMSYSERR_NOERROR) {
+    if (!audio_open(hev)) {
         MessageBox(NULL, "waveOutOpen failed - no usable Windows audio output.",
                    "VOPL3 renderer", MB_OK | MB_ICONSTOP);
         return 1;
-    }
-
-    /* prime all buffers */
-    for (i = 0; i < nbuf; i++) {
-        hdr[i].lpData         = (char *)bufs[i];
-        hdr[i].dwBufferLength = FRAMES * 4;
-        hdr[i].dwFlags        = 0;
-        hdr[i].dwLoops        = 0;
-        waveOutPrepareHeader(hwo, &hdr[i], sizeof(WAVEHDR));
-        drain_events();
-        render_buffer(bufs[i]);
-        apply_gain(bufs[i], FRAMES * 2);
-        waveOutWrite(hwo, &hdr[i], sizeof(WAVEHDR));
     }
 
     /* Realtime priority is managed DYNAMICALLY in the loop below (see
@@ -640,10 +655,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
         {
             DWORD nw = drain_events();
             if (nw) {                          /* chip touched: (re)start */
+                if (!hwo && !audio_open(hev)) {
+                    audio_stop();
+                    return 1;
+                }
                 idle    = 0;
                 silence = 0;
             }
         }
+        if (!hwo) continue;
         for (i = 0; i < nbuf; i++) {
             if (hdr[i].dwFlags & WHDR_DONE) {
                 DWORD n = drain_events();
@@ -657,7 +677,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
                     silent = buf_silent(bufs[i], FRAMES * 2);  /* raw output */
                     apply_gain(bufs[i], FRAMES * 2);
                     if (n == 0 && pq_head == pq_tail && silent) {
-                        if (++silence >= IDLE_AFTER) idle = 1;
+                        if (++silence >= IDLE_AFTER) {
+                            idle = 1;
+                            audio_close();
+                        }
                     } else if (n == 0) {
                         silence = 0;           /* still sounding (decay etc.) */
                     }
